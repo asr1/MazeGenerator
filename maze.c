@@ -1,0 +1,641 @@
+/**
+ * @file      maze.c
+ * @author    Alex RInehart
+ * @date      2015-04-08: Last updated
+ * @brief     Character driver example
+ * @copyright MIT License (c) 2015
+ */
+ 
+/*
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+*/
+
+#include <linux/kernel.h>
+#include <linux/module.h>
+#include <linux/fs.h>
+#include <linux/random.h>
+#include <asm/uaccess.h>
+
+
+///--- Prototypes ---///
+int init_module(void);
+void cleanup_module(void);
+static int device_open(struct inode*, struct file*);
+static int device_release(struct inode*, struct file*);
+static ssize_t device_read(struct file*, char*, size_t, loff_t*);
+static ssize_t device_write(struct file*, const char*, size_t, loff_t*);
+static void DivideHorz(int left, int right, int top, int bottom);
+static void DivideVert(int left, int right, int top, int bottom);
+static void GenerateMaze(int left, int right, int top, int bottom);
+static void GenerateOutside(void);
+static int solve_maze(void);
+static int solve_maze_recursive(int col, int row, int at_start);
+
+///--- Macros ---///
+#define SUCCESS 0
+#define DEVICE_NAME "cpre308-maze"
+/// The max length of the message from the device
+#define BUF_LEN 80
+
+	#define MAX_WIDTH 25 //The maximum size of the maze
+	#define MAX_HEIGHT 25
+	#define MIN_SIZE 5
+	#define MIN_RES 4
+	#define WALL_CHAR '#'
+	#define PASS_CHAR ' '
+	#define SOLVE_CHAR '*'
+ 
+///--- Global Variables ---///
+static int width = MAX_WIDTH; //The actual height and width of the maze
+static int height = MAX_HEIGHT;
+static int resolution = MIN_RES; //The resolution of our maze
+static int wallSpace = 0; //The chance of a wall actually being a walkway
+
+
+static int Major;			// Major number assigned to this device driver
+static int Device_Open = 0;	// is the device open already?
+static char msg[BUF_LEN];	// The message the device will return
+static char *msg_ptr;
+//TODO note, one of our difficulties will be creating a public, global maze
+//sized off a value we read in from a file without malloc.
+//Possible solution: have MAX_SIZE which we declare and WORKING_SIZE,
+//which we actually initialize and use.
+static char cells[MAX_WIDTH][MAX_HEIGHT]; //Our public, global maze
+static int maze_valid = 0;
+static int read_index = -1;
+
+
+
+///--- Register Callbacks ---///
+static struct file_operations fops = {
+	.read = device_read,
+	.write = device_write,
+	.open = device_open,
+	.release = device_release
+};
+
+///--- Init Module ---///
+int __init device_init(void)
+{
+	Major = register_chrdev(0, DEVICE_NAME, &fops);
+	
+	if(Major < 0)
+	{
+		printk(KERN_ALERT "Registering char device failed with %d\n", Major);
+		return Major;
+	}
+
+	printk(KERN_INFO "I was assigned major number %d.\n", Major);
+	printk(KERN_INFO "'mknod /dev/%s c %d 0'.\n", DEVICE_NAME, Major);
+	printk(KERN_INFO );
+
+	return SUCCESS;
+}
+
+
+//Pseudo random functions
+//Return a random number on the range [0,maxVal)
+static int rand(int maxVal)
+{
+	unsigned int next;
+	get_random_bytes(&next, 4);
+
+	if(!maxVal) maxVal++;//eliminate those pesky divide by 0 errors.
+    return (unsigned int)next % maxVal; //remove overflow
+}
+
+
+//Set every element of the array to a passageway
+static void InitializeMaze(void)
+{
+	int x,y;
+	for(x = 0; x < MAX_WIDTH; x++)
+	{
+		for(y = 0; y < MAX_HEIGHT; y++)
+		{
+			cells[x][y] = PASS_CHAR;
+		}
+	}
+
+}
+
+//Generate the perimeter of the maze.
+static void GenerateOutside(void)
+{
+
+       int x;
+       int exitHole; //Used to determine beginning and end
+       for(x = 0; x < width; x++)
+       {
+             cells[x][0] = WALL_CHAR;
+             cells[x][height-1] = WALL_CHAR;
+       }
+       for(x=0; x < height; x++)
+       {
+             cells[0][x] = WALL_CHAR;
+             cells[width-1][x] = WALL_CHAR;                 
+       }
+	
+
+
+       //Add a starting/ending space
+       exitHole = rand(2);//Introduces randomness to start/end position
+
+       cells[exitHole][1-exitHole] = PASS_CHAR;
+       exitHole = rand(2);
+       cells[width - 2 + exitHole][height - 1 - exitHole] = PASS_CHAR;
+}
+
+
+//Left, right, top bottom are the corners of the section we want
+//To operate on. This is the divide function which will split
+//The maze. Assumes maze is a 2D array. Returns void.
+//This is where we recurse.
+//NB: We are using a modified recursive division algorithm
+static void GenerateMaze(int left, int right, int top, int bottom)
+{
+	int width = right - left;
+	int height = bottom - top; //Assume top left is 0
+
+	//We're big enough that we still want to split
+	if(width > resolution && height > resolution)
+	{
+		//Choose what direction we want to split
+		if(width > height)
+		{
+			DivideHorz(left, right, top, bottom);
+		}
+		else if(height > width)
+		{
+			DivideVert(left, right, top, bottom);
+		}
+		else//They're equal, choose a direction randomly
+		{					
+			int choice = rand(2);
+			if(choice)
+			{
+				DivideHorz(left, right, top, bottom);
+			}	
+			else
+			{
+				DivideVert(left, right, top, bottom);
+			}
+		}
+	}
+	else if(width > resolution && height <= resolution)
+	{
+		DivideHorz(left, right, top, bottom);
+	}
+	else if(width <= resolution && height > resolution)
+	{
+		DivideVert(left, right, top, bottom);
+	}
+	
+}
+
+///We split the maze vertically.
+//As in, we make a line from left to right
+//This is "private", ie, we only call it from GenerateMaze
+static void DivideVert(int left, int right, int top, int bottom)
+{
+	int y;
+	int walkWay;
+	int divPos = top + 2 + rand( (bottom - top - 1)/2 -1) * 2;
+	if(divPos % 2 == 1)//Keep it even
+	{
+		divPos+=1;
+	}
+	
+	//Make a wall here
+	for(y = left; y < right; y++)
+	{
+		if(rand(100) < wallSpace)//Chance of it being a passageway
+		{	
+			cells[y][divPos] = PASS_CHAR;
+		}
+		else
+		{
+			cells[y][divPos] = WALL_CHAR; 
+		}
+	}
+
+	//Now an odd space for walkway
+	walkWay = left + rand( (right - left) /2 -1) * 2 + 1;//Clean me
+	cells[walkWay][divPos] = PASS_CHAR;
+	//We now have 2 parts. Do this for both of them.
+	GenerateMaze(left, right, top, divPos);
+	GenerateMaze(left, right, divPos, bottom);
+}
+
+//Same as above, only in the other direction.
+static void DivideHorz(int left, int right, int top, int bottom)//actually horz
+{
+	int x;	
+	int walkWay;
+	//Pick a random position in the current wall
+	int divPos = left + 2 + rand((right-left-1)/2-1)*2; 
+	
+	//Actually make a wall
+	for(x = top; x < bottom; x++)
+	{
+		if(rand(100) < wallSpace)//Chance of it being a passageway
+		{
+			cells[divPos][x] = PASS_CHAR;
+		}
+		else
+		{
+			cells[divPos][x] = WALL_CHAR;
+		}
+	}
+
+	//Grab an odd-numbered space for a walkway
+	walkWay = top + rand((bottom - top)/2 -1)*2+1; //Another gross line of arithmetic.
+	cells[divPos][walkWay] = PASS_CHAR;
+
+	//Recursively make this room smaller until it fits our smallest resolution
+	GenerateMaze(left, divPos, top, bottom);
+	GenerateMaze(divPos, right, top, bottom);
+}
+
+///--- Cleanup Module ---///
+void __exit device_exit(void)
+{
+	unregister_chrdev(Major, DEVICE_NAME);
+} 
+
+///--- register init and exit functions ---///
+module_init(device_init);
+module_exit(device_exit);
+
+///--- Device Open ---///
+static int device_open(struct inode *inode, struct file *file)
+{
+
+	//TODO read from file
+	if (Device_Open)
+		return -EBUSY;
+	
+
+	Device_Open++;
+	//sprintf(msg, "I already told you %d times Hello World!\n", counter++);
+	msg_ptr = msg;
+	try_module_get(THIS_MODULE);
+	return SUCCESS;
+}
+
+///--- Device Release ---///
+static int device_release(struct inode *inode, struct file *file)
+{
+	Device_Open--;
+	module_put(THIS_MODULE);
+	return SUCCESS;
+}
+
+///--- Device Read ---///
+static ssize_t device_read(struct file *file, char *buffer, size_t length, loff_t *offset)
+{
+	int bytes_read = 0;
+	int i;
+
+/*
+	while (length && *msg_ptr)
+	{
+		// the buffer is in the user data segment, not the kernel
+		// segment so "*" assignment won't work.  We have to use
+		// put_user which copies data from the kernel data segment
+		// to the user data segment.
+		put_user(*(msg_ptr++), buffer++);
+		
+		length--;
+		bytes_read++;
+	}
+*/
+
+	if (!maze_valid)
+	{
+		read_index = -1;
+		printk("No maze to print\n");
+		return 0;
+	}
+
+	read_index++;
+
+	if (read_index >= height)
+	{
+		read_index = -1;
+		return 0;
+	}
+
+	for(i = 0; i < width && (length - 1); i++)
+	{
+		put_user(cells[i][read_index], buffer++);
+		bytes_read++;
+		length--;
+	}
+	put_user('\n', buffer++);
+	bytes_read++;
+	length--;
+
+	return bytes_read;
+}
+
+///--- Device Write ---///
+static ssize_t device_write(struct file *file, const char *buffer, size_t len, loff_t *offset)
+{
+	int i = 0;
+	char firstChar;
+	char parsedText[BUF_LEN];
+	int parseIndex = 0;	
+	char tempChar;
+	int parsingNum = 0; //Checks if last character was a number
+	int digitPlace = 1; //Used for conversion to decimal
+	int tempHeight = 0 , tempWidth = 0, tempRes = 0, tempWall = 0;
+	int c = 0, r = 0;
+	int set_width = 0;
+
+	enum
+	{
+	PARSE_HEIGHT,
+	PARSE_WIDTH,
+	PARSE_RES,
+	PARSE_WALL,
+	PARSE_DONE
+	}parseState = PARSE_WALL;
+
+	maze_valid = 0;
+
+	get_user(firstChar, buffer); //Grab the first character to see what we're working with.
+
+
+	//We got a file, let's parse it
+	switch(firstChar) //todo
+	{	
+		case  WALL_CHAR:
+		case PASS_CHAR: //A maze was passed in, parse it and Solve it.
+			i = 0;
+			while (i < len)
+			{
+				do
+				{
+					get_user(tempChar, buffer + i);
+					i++;
+					if (tempChar == '\n')
+					{
+						if (!set_width)
+						{
+							width = r;
+							set_width = 1;
+						}
+						c++;
+						r = 0;
+					}
+					else if ( !(tempChar == WALL_CHAR || tempChar == PASS_CHAR) )
+					{
+						printk("Invalid file format\n");
+						return -EINVAL;
+					}
+				}
+				while ( !(tempChar == WALL_CHAR || tempChar == PASS_CHAR) && i < len);
+				if (tempChar == WALL_CHAR || tempChar == PASS_CHAR) {
+					cells[c][r] = tempChar;
+					r++;
+				}
+			}
+			height = c;
+			if (!solve_maze())
+			{
+				maze_valid = 1;
+			}
+			break;
+		default: //Parameters were passed in, create a maze.
+		//Format of input file:
+		//Height width resolution
+
+			//Parse the script for the numbers, and populate an array
+			for (i = 0; i < len && i < BUF_LEN; i++)
+			{
+				get_user(tempChar, buffer + i);		
+				if(tempChar == ' ')
+				{
+					if(parsingNum) //We reached a space after a number
+					{
+						parsedText[parseIndex] = '\0';
+						parseIndex++;
+					}
+					parsingNum = 0;
+				}
+				else if(tempChar >= '0' && tempChar <= '9') //We have a number
+				{
+					parsingNum = 1;
+					if(parseIndex < BUF_LEN)
+					{
+						parsedText[parseIndex] = tempChar;	
+						parseIndex++;
+					}
+					else
+					{
+						printk("File is too long\n");
+						return -EINVAL;
+					}
+				}
+				else
+				{
+					printk("Invalid file format\n");
+					return -EINVAL;
+				}
+			}//End for loop, end file parsing
+
+			//Begin parsing the array we ppopulated above
+			//And parse backwards to make math easier
+			for(i = parseIndex -1; i >= 0; i--)
+			{
+				switch(parseState)
+				{ //Read the value until we see a space, then move to the 'next' value.
+					case PARSE_WALL: //Walkways
+						if(parsedText[i])
+						{
+							tempWall += (parsedText[i] - '0') * digitPlace;
+							digitPlace *= 10;
+						}
+						else
+						{
+							digitPlace = 1;
+							parseState = PARSE_RES;
+						}
+						break;
+					case PARSE_RES: //Resolution
+						if(parsedText[i])
+						{
+							tempRes += (parsedText[i] - '0') * digitPlace;
+							digitPlace *= 10;
+						}
+						else
+						{
+							digitPlace = 1;
+							parseState = PARSE_WIDTH;
+						}
+						break;
+					case PARSE_WIDTH: //Width
+						if(parsedText[i])
+						{
+							tempWidth += (parsedText[i] - '0') * digitPlace;
+							digitPlace *= 10;
+						}
+						else
+						{
+							digitPlace = 1;
+							parseState = PARSE_HEIGHT;
+						}
+						break;
+					case PARSE_HEIGHT: //Height
+						if(parsedText[i])
+						{
+							tempHeight += (parsedText[i] - '0') * digitPlace;
+							digitPlace *= 10;
+						}
+						else
+						{
+							digitPlace = 1;
+							parseState = PARSE_DONE;
+						}
+						break;	
+					default:
+						break;
+
+				}//End switch
+			}//End for
+
+			//Validation
+			if(tempHeight < MAX_HEIGHT && tempHeight > MIN_SIZE)
+			{
+				height = tempHeight;
+			}
+			if(tempWidth < MAX_WIDTH && tempWidth > MIN_SIZE)
+			{
+				width = tempWidth;
+			}
+			if(tempRes > MIN_RES)
+			{
+				resolution = tempRes;
+			}
+			if(tempWall >= 0 && tempWall <= 100) //WallSpace IS a percent, after all
+			{
+				wallSpace = tempWall;
+			} 
+	
+			//Create maze
+			InitializeMaze();
+			GenerateMaze(0, width, 0, height);
+			GenerateOutside();
+
+			maze_valid = 1;
+		break;
+	}
+
+	return len;
+}
+
+static int solve_maze_recursive(int col, int row, int at_start)
+{
+	char old_char;
+
+	if (col < 0 || col >= width || row < 0 || row >= height)
+	{
+		// out of bounds
+		return -1;
+	}
+
+	if (cells[col][row] == SOLVE_CHAR)
+	{
+		return -1;
+	}
+
+	if (cells[col][row] == WALL_CHAR)
+	{
+		return -1;
+	}
+
+	old_char = cells[col][row];
+	cells[col][row] = SOLVE_CHAR;
+
+	if ( !at_start && (col == 0 || col == width-1 || row == 0 || row == height-1))
+	{
+		// found the exit
+		return 0;
+	}
+
+	if (!solve_maze_recursive(col-1, row, 0))
+	{
+		return 0;
+	}
+	if (!solve_maze_recursive(col+1, row, 0))
+	{
+		return 0;
+	}
+	if (!solve_maze_recursive(col, row-1, 0))
+	{
+		return 0;
+	}
+	if (!solve_maze_recursive(col, row+1, 0))
+	{
+		return 0;
+	}
+
+	cells[col][row] = old_char;
+	
+	return -1;
+}
+
+// returns 0 on success, non-zero on error
+static int solve_maze(void)
+{
+	// find a cell to enter the maze
+	int start_col = -1, start_row = -1;
+	int x;
+
+	for(x = 0; x < width && start_col == -1; x++)
+	{
+		if (cells[x][0] == PASS_CHAR)
+		{
+			start_col = x;
+			start_row = 0;
+		}
+		if (start_col == -1 && cells[x][height-1] == PASS_CHAR)
+		{
+			start_col = x;
+			start_row = height-1;
+		}
+	}
+	for(x=0; x < height; x++)
+	{
+		if (cells[0][x] == PASS_CHAR)
+		{
+			start_col = 0;
+			start_row = x;
+		}
+		if (start_col == -1 && cells[width-1][x] == PASS_CHAR)
+		{
+			start_col = width-1;
+			start_row = x;
+		}               
+	}
+	if (start_col == -1)
+	{
+		printk("Failed to solve maze\n");
+		return -1;
+	}
+	
+	if (!solve_maze_recursive(start_col, start_row, 1))
+	{
+		return 0;
+	}
+	
+	printk("Failed to solve maze\n");
+	return -1;
+}
+

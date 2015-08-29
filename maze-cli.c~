@@ -1,0 +1,294 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <argp.h>
+#include <sys/stat.h>
+#include "libbmp.h"
+
+#define MAX_WIDTH 25 //The maximum size of the maze
+#define MAX_HEIGHT 25
+
+#define DEFAULT_CELL_PIXELS 16
+#define xstr(s) str(s)
+#define str(s) #s
+
+#define BUF_LEN MAX_WIDTH + 2
+
+static char cells[MAX_WIDTH][MAX_HEIGHT];
+static int maze_width = 0;
+static int row_index = 0;
+
+typedef enum
+{
+	OUT_FORMAT_TEXT,
+	OUT_FORMAT_BMP,
+	OUT_FORMAT_PNG
+} out_format;
+
+static struct argp_option options[] = 
+{
+	// Note when running: optional arguments to short options cannot have a space between the short option and the argument, i.e. '-b 16' is invalid: use '-b16' instead
+	{"output", 'o', "FILE", 0, "File to output to. Default is stdout"},
+	{"maze", 'm', "FILE", 0, "File containing a maze to solve"},
+	{"generate", 'g', "ARGS", 0, "String containing arguments for maze generation. Format is \"Height Width Resolution Space\""},
+	{"bmp", 'b', "SIZE", OPTION_ARG_OPTIONAL, "Write output in bmp format instead of plain text. SIZE determines the size of the image and defaults to " xstr(DEFAULT_CELL_PIXELS) ". The minimum size is 1."},
+//	{"png", 'p', 0, 0, "Write output in png format instead of plain text"}
+	{0}
+};
+
+struct arguments
+{
+	char *output_file;
+	char *maze_file;
+	char *generate_args;
+	out_format format;
+	int cell_pixels;
+};
+
+error_t parse_opt(int key, char *arg, struct argp_state *state)
+{
+	struct arguments *arguments = state->input;
+	switch(key)
+	{
+		case 'o':
+			arguments->output_file = arg;
+			break;
+		case 'm':
+			arguments->maze_file = arg;
+			break;
+		case 'g':
+			arguments->generate_args = arg;
+			break;
+		case 'p':
+			arguments->format = OUT_FORMAT_PNG;
+			break;
+		case 'b':
+			arguments->format = OUT_FORMAT_BMP;
+			if (arg)
+			{
+				int argint = atoi(arg);
+				if (argint > 0)
+				{
+					arguments->cell_pixels = argint;
+				}
+			}
+			break;
+		default:
+			return ARGP_ERR_UNKNOWN;
+	}
+	return 0;
+}
+
+static struct argp argp = {&options, parse_opt};
+
+bmp_pixel_t wall_cell_color = {0xFF, 0x00, 0x00, 0x00};
+bmp_pixel_t path_cell_color = {0xFF, 0xFF, 0xFF, 0xFF};
+bmp_pixel_t solve_cell_color = {0xFF, 0x00, 0xFF, 0x00};
+bmp_pixel_t invalid_cell_color = {0x00, 0x00, 0x00, 0x00};
+
+void write_row(FILE *f, char *s, out_format format)
+{
+	int i;
+	switch (format)
+	{
+		case OUT_FORMAT_TEXT:
+			fprintf(f, "%s\n", s);
+			break;
+		case OUT_FORMAT_BMP:
+		case OUT_FORMAT_PNG:
+			i = 0;
+			while (s[i])
+			{
+				cells[i][row_index] = s[i];
+				i++;
+			}
+			maze_width = i;
+			row_index++;
+			break;
+	}
+}
+
+int main(int argc, char* argv[])
+{
+	char buf[BUF_LEN];
+
+	struct arguments arguments;
+	arguments.output_file = NULL;
+	arguments.maze_file = NULL;
+	arguments.generate_args = NULL;
+	arguments.format = OUT_FORMAT_TEXT;
+	arguments.cell_pixels = DEFAULT_CELL_PIXELS;
+	argp_parse(&argp, argc, argv, 0, 0, &arguments);
+
+	FILE *out = stdout;
+	FILE *maze_in = NULL;
+	char *args = NULL;
+	int args_malloc = 0;
+
+	if (arguments.output_file)
+	{
+		if (arguments.format == OUT_FORMAT_TEXT)
+		{
+			out = fopen(arguments.output_file, "w");
+		}
+		else
+		{
+			out = fopen(arguments.output_file, "wb");
+		}
+		
+		if (!out)
+		{
+			printf("Invalid output file\n");
+			return 1;
+		}
+	}
+	else if (arguments.format != OUT_FORMAT_TEXT)
+	{
+		printf("Must specify an output file when not writing as text\n");
+		return 1;
+	}
+
+	if (arguments.maze_file)
+	{
+		FILE *in = fopen(arguments.maze_file, "r");
+		if (!in)
+		{
+			printf("Invalid maze file\n");
+			return 1;
+		}
+		struct stat st;
+		stat(arguments.maze_file, &st);
+		size_t in_size = st.st_size;
+		args = malloc(in_size);
+		if (!args)
+		{
+			printf("Failed to malloc input maze\n");
+			return 1;
+		}
+		args_malloc = 1;
+
+		fread(args, 1, in_size, in);
+		
+		fclose(in);
+		in = NULL;
+	}
+	else if (arguments.generate_args)
+	{
+		args = arguments.generate_args;
+	}
+	else
+	{
+		printf("Invalid arguments\n");
+		return 1;
+	}
+
+	FILE *f = fopen("/dev/cpre308-maze", "r+");
+	if (!f)
+	{
+		printf("Kernel module not found\n");
+		return 1;
+	}
+	fputs(args, f);
+	while(fgets(buf, BUF_LEN, f)) {
+		char *nl = strrchr(buf, '\n');
+		if (nl)
+		{
+			*nl = '\0';
+		}
+		write_row(out, buf, arguments.format);
+	}
+
+	if (arguments.format == OUT_FORMAT_BMP)
+	{
+		fclose(out);
+		out = NULL;
+		
+		bmp_info_t bmp_info;
+		bmp_info.width = arguments.cell_pixels * maze_width;
+		bmp_info.height = arguments.cell_pixels * row_index;
+		bmp_info.pixels = calloc(bmp_info.width * bmp_info.height, sizeof(bmp_pixel_t));
+
+		int i, j, r, c;
+		for (i = 0; i < maze_width; i++)
+		{
+			for (j = 0; j < row_index; j++)
+			{
+				bmp_pixel_t color = invalid_cell_color;
+				switch (cells[i][j])
+				{
+					case '#':
+						color = wall_cell_color;
+						break;
+					case ' ':
+						color = path_cell_color;
+						break;
+					case '*':
+						color = solve_cell_color;
+						break;
+				}
+				
+				for (r = i * arguments.cell_pixels; r < (i+1) * arguments.cell_pixels; r++)
+				{
+					for (c = j * arguments.cell_pixels; c < (j+1) * arguments.cell_pixels; c++)
+					{
+						*bmp_pixels(&bmp_info, r, c) = color;
+					}
+				}
+			}
+		}
+
+		bmp_write(arguments.output_file, &bmp_info);
+	}
+/*
+	if (arguments.format == OUT_FORMAT_PNG)
+	{
+		// write to png file
+		png_structp png_ptr = png_create_write_struct(PNG_LIBPNG_VER_STRING,
+				(png_voidp)user_error_ptr, user_error_fn, user_warning_fn);
+		if (!png_ptr)
+		{
+			return 1;
+		}
+
+		png_infop info_ptr = png_create_info_struct(png_ptr);
+		if (!info_ptr)
+		{
+			png_destroy_write_struct(&png_ptr, (png_infopp)NULL);
+			return 1;
+		}
+
+		if (setjmp(png_jmpbuf(png_ptr)))
+		{
+			png_destroy_write_struct(&png_ptr, &info_ptr);
+			return 1;
+		}
+
+		png_init_io(png_ptr, out);
+
+		int png_width = maze_width * CELL_PIXELS;
+		int png_height = row_index * CELL_PIXELS;
+
+		png_set_IHDR(png_ptr, info_ptr, png_width, png_height, 16, PNG_COLOR_TYPE_RGB_ALPHA,
+				PNG_INTERLACE_NONE, PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_DEFAULT);
+
+		png_bytep row_pointers[png_height] = png_malloc(png_ptr, height*(sizeof (png_bytep)));
+
+
+		
+	}
+*/
+	fclose(f);
+	f = NULL;
+	if (out)
+	{
+		fclose(out);
+		out = NULL;
+	}
+	if (args_malloc)
+	{
+		free(args);
+		args = NULL;
+	}
+
+	return 0;
+}

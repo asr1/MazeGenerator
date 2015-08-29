@@ -1,0 +1,10 @@
+to login:
+    username: root
+    password: (none)
+
+to exit the kernel, run:
+    halt
+
+to access your home directory, put this in fstab (NETID is your ISU netid):
+
+none            /host           hostfs  defaults,/home/NETID/cpre308/project-E3/final_project    0   0

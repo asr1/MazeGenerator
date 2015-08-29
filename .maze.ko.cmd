@@ -1,0 +1,1 @@
+cmd_/home/bam/cpre308/project-E3/final_project/maze.ko := ld -r  -m elf_x86_64 -T ./scripts/module-common.lds --build-id  -o /home/bam/cpre308/project-E3/final_project/maze.ko /home/bam/cpre308/project-E3/final_project/maze.o /home/bam/cpre308/project-E3/final_project/maze.mod.o

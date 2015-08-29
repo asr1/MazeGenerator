@@ -1,0 +1,7 @@
+#include <stdio.h>
+
+int main(int argc, char* argv[])
+{
+	FILE *f = fopen("/dev/cpre308-maze", "rw");
+	fwrite(argv[1], 1, strlen(argv[1]), f);
+}

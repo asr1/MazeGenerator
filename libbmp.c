@@ -1,0 +1,181 @@
+//Created by Ben Myshkowec
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include "libbmp.h"
+
+int is_host_le()
+{
+    volatile uint32_t x = 1;
+    volatile uint8_t *y = (volatile char *) &x;
+    return *y;
+}
+
+uint32_t my_htole32(uint32_t i)
+{
+    if (!is_host_le())
+    {
+        uint8_t *x = (uint8_t *) &i;
+        uint8_t t = x[3];
+        x[3] = x[0];
+        x[0] = t;
+        t = x[2];
+        x[2] = x[1];
+        x[1] = t;
+    }
+    return i;
+}
+
+uint16_t my_htole16(uint16_t i)
+{
+    if (!is_host_le())
+    {
+        uint8_t *x = (uint8_t *) &i;
+        uint8_t t = x[1];
+        x[1] = x[0];
+        x[0] = t;
+    }
+    return i;
+}
+
+int bmp_write(const char *path, bmp_info_t *info)
+{
+    FILE *f = fopen(path, "wb");
+    if (!f)
+    {
+        return -1;
+    }
+    
+    int i, j;
+    
+    uint32_t header_size = 14;
+    uint32_t dib_header_size = 108;
+    uint32_t offset_pixel_array = header_size + dib_header_size;
+    
+    // unsigned 1 byte
+    uint8_t b1;
+    // unsigned 2 bytes
+    uint16_t b2;
+    // unsigned 4 bytes
+    uint32_t b4;
+    
+    // header
+    // ASCII 'B'
+    b1 = 0x42;
+    fwrite(&b1, 1, 1, f);
+    // ASCII 'M'
+    b1 = 0x4D;
+    fwrite(&b1, 1, 1, f);
+    // file size
+    b4 = htole32(offset_pixel_array + info->width * info->height);
+    fwrite(&b4, 4, 1, f);
+    // reserved 1
+    b2 = 0;
+    fwrite(&b2, 2, 1, f);
+    // reserved 2
+    b2 = 0;
+    fwrite(&b2, 2, 1, f);
+    // offset of pixel array
+    b4 = htole32(offset_pixel_array);
+    fwrite(&b4, 4, 1, f);
+    
+    // DIB header
+    // using version BITMAPV4HEADER
+    // size of header
+    b4 = htole32(dib_header_size);
+    fwrite(&b4, 4, 1, f);
+    // bitmap width
+    b4 = htole32(info->width);
+    fwrite(&b4, 4, 1, f);
+    // bitmap height
+    b4 = htole32(info->height);
+    fwrite(&b4, 4, 1, f);
+    // number of color panes
+    b2 = htole16(1);
+    fwrite(&b2, 2, 1, f);
+    // color depth - 32bpp is the only depth supported by this implementation
+    b2 = htole16(32);
+    fwrite(&b2, 2, 1, f);
+    // compression method - BI_BITFIELDS is the only one supported by this implementation
+    b4 = htole32(3);
+    fwrite(&b4, 4, 1, f);
+    // image size in bytes
+    b4 = htole32(info->width * info->height * 4);
+    fwrite(&b4, 4, 1, f);
+    // horizontal resolution in pixel per meter - 72 DPI
+    b4 = htole32(2835);
+    fwrite(&b4, 4, 1, f);
+    // vertical resolution in pixel per meter - 72 DPI
+    b4 = htole32(2835);
+    fwrite(&b4, 4, 1, f);
+    // number of colors in the color palatte - 0 means default to 2^n
+    b4 = 0;
+    fwrite(&b4, 4, 1, f);
+    // number of important colors used - 0 means every color is important
+    b4 = 0;
+    fwrite(&b4, 4, 1, f);
+    // red mask - only valid for BI_BITFIELDS
+    b4 = htole32(0x00FF0000);
+    fwrite(&b4, 4, 1, f);
+    // green mask - only valid for BI_BITFIELDS
+    b4 = htole32(0x0000FF00);
+    fwrite(&b4, 4, 1, f);
+    // blue mask - only valid for BI_BITFIELDS
+    b4 = htole32(0x000000FF);
+    fwrite(&b4, 4, 1, f);
+    // alpha mask - required
+    b4 = htole32(0xFF000000);
+    fwrite(&b4, 4, 1, f);
+    // DIB color space
+    b4 = htole32(0x73524742); // ASCII "sRGB"
+    fwrite(&b4, 4, 1, f);
+    // CIEXYZTRIPLE Color Space endpoints - unused for sRGB, Wikipedia says this is 36 bytes
+    for (i = 0; i < 36; i++)
+    {
+        b1 = 0;
+        fwrite(&b1, 1, 1, f);
+    }
+    // red gamma - unused for sRGB
+    b4 = 0;
+    fwrite(&b4, 4, 1, f);
+    // green gamma - unused for sRGB
+    b4 = 0;
+    fwrite(&b4, 4, 1, f);
+    // blue gamma - unused for sRGB
+    b4 = 0;
+    fwrite(&b4, 4, 1, f);
+    
+    // pixel array
+    for (i = info->height - 1; i >= 0; i--)
+    {
+        for (j = 0; j < info->width; j++)
+        {
+            // write one pixel in format ARGB (BGRA little-endian)
+            
+            // what this line does: pixel = &((*(info->pixels))[i][j])
+            bmp_pixel_t *pixel = bmp_pixels(info, i, j);
+            // array length 4 of unsigned 1 byte
+            uint8_t b1_4[4];
+            b1_4[0] = pixel->blue;
+            b1_4[1] = pixel->green;
+            b1_4[2] = pixel->red;
+            b1_4[3] = pixel->alpha;
+            fwrite(b1_4, 1, 4, f);
+        }
+    }
+
+    fclose(f);
+    
+    return 0;
+}
+
+bmp_pixel_t get_bmp_pixel(uint8_t alpha, uint8_t red, uint8_t green, uint8_t blue)
+{
+    bmp_pixel_t pixel;
+    pixel.alpha = alpha;
+    pixel.red = red;
+    pixel.green = green;
+    pixel.blue = blue;
+    return pixel;
+}
